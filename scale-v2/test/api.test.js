@@ -766,6 +766,29 @@ async function tenantWithReceiptChain(label, count) {
   return { token, tenantId: created.body.actor.tenantId, receiptIds };
 }
 
+// The append-only trigger refuses this UPDATE from the app, so simulate an
+// attacker with direct database access by bypassing triggers for one change.
+async function tamperReceiptDescription(receiptId) {
+  const pg = await import("pg");
+  const client = new pg.default.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  await client.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SET LOCAL session_replication_role = replica");
+    const updated = await client.query(
+      "UPDATE evidence_receipts SET description = description || ' (altered)' WHERE id = $1",
+      [receiptId]
+    );
+    assert.equal(updated.rowCount, 1);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    await client.end();
+  }
+}
+
 test("receipts: verify-chain passes for an intact tenant chain", async () => {
   const { token, tenantId } = await tenantWithReceiptChain("Chain Intact", 3);
 
@@ -783,26 +806,7 @@ test("receipts: verify-chain reports a tampered receipt", async () => {
   const { token, receiptIds } = await tenantWithReceiptChain("Chain Tampered", 3);
   const tampered = receiptIds[1];
 
-  // The append-only trigger refuses this UPDATE from the app, so simulate an
-  // attacker with direct database access by bypassing triggers for one change.
-  const pg = await import("pg");
-  const client = new pg.default.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
-  await client.connect();
-  try {
-    await client.query("BEGIN");
-    await client.query("SET LOCAL session_replication_role = replica");
-    const updated = await client.query(
-      "UPDATE evidence_receipts SET description = description || ' (altered)' WHERE id = $1",
-      [tampered]
-    );
-    assert.equal(updated.rowCount, 1);
-    await client.query("COMMIT");
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    throw error;
-  } finally {
-    await client.end();
-  }
+  await tamperReceiptDescription(tampered);
 
   const chain = await req("GET", "/api/receipts/verify-chain", { token });
   assert.equal(chain.status, 200);
@@ -814,6 +818,41 @@ test("receipts: verify-chain reports a tampered receipt", async () => {
   assert.equal(failure.chain_sequence, 2);
   assert.equal(failure.cryptographic_checks.hash, false, "the recomputed hash no longer matches");
   assert.equal(failure.previous_link, true, "the stored links are untouched");
+});
+
+test("receipts: verify passes for an intact receipt", async () => {
+  const { token, receiptIds } = await tenantWithReceiptChain("Receipt Intact", 3);
+
+  const verified = await req("GET", `/api/receipts/${receiptIds[1]}/verify`, { token });
+  assert.equal(verified.status, 200);
+  assert.equal(verified.body.verified, true);
+  assert.equal(verified.body.status, "VERIFIED");
+  assert.equal(verified.body.receipt.id, receiptIds[1]);
+  assert.equal(verified.body.checks.previous_link, true);
+  assert.equal(verified.body.checks.next_link, true);
+  for (const [name, ok] of Object.entries(verified.body.checks)) {
+    assert.equal(ok, true, `check ${name} passes`);
+  }
+});
+
+test("receipts: verify reports a tampered receipt", async () => {
+  const { token, receiptIds } = await tenantWithReceiptChain("Receipt Tampered", 3);
+  const tampered = receiptIds[1];
+  await tamperReceiptDescription(tampered);
+
+  const verified = await req("GET", `/api/receipts/${tampered}/verify`, { token });
+  assert.equal(verified.status, 200);
+  assert.equal(verified.body.verified, false);
+  assert.equal(verified.body.status, "TAMPER_DETECTED");
+  assert.equal(verified.body.receipt.id, tampered);
+  assert.equal(verified.body.checks.hash, false, "the recomputed hash no longer matches");
+  assert.equal(verified.body.checks.previous_link, true, "the stored links are untouched");
+  assert.equal(verified.body.checks.next_link, true, "the stored links are untouched");
+
+  // Its untouched neighbour still verifies on its own.
+  const neighbour = await req("GET", `/api/receipts/${receiptIds[2]}/verify`, { token });
+  assert.equal(neighbour.status, 200);
+  assert.equal(neighbour.body.status, "VERIFIED");
 });
 
 async function resetAuthAttempts() {

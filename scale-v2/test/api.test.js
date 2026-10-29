@@ -733,6 +733,128 @@ test("billing stays reachable for a read-only tenant so they can pay to return",
   assert.equal(checkout.status, 503, "it refuses only because Stripe is unconfigured here");
 });
 
+// A fresh organisation owns its own receipt chain, so these assertions are
+// independent of whatever receipts other tests have written.
+async function tenantWithReceiptChain(label, count) {
+  await resetAuthAttempts();
+  const suffix = randomUUID().slice(0, 8);
+  const created = await req("POST", "/api/auth/signup", {
+    body: { organisationName: `${label} ${suffix}`, email: `${label.toLowerCase().replace(/\W+/g, "-")}-${suffix}@example.com`, password: "a-long-enough-passphrase" }
+  });
+  assert.equal(created.status, 201);
+  const token = created.body.token;
+
+  const evidence = await req("POST", "/api/evidence", { token, body: { claim: `${label} claim ${suffix}` } });
+  assert.equal(evidence.status, 201);
+  const evidenceId = evidence.body.id;
+  for (const to of ["AUTHORIZED", "EXECUTED"]) {
+    const moved = await req("POST", `/api/evidence/${evidenceId}/transition`, { token, body: { to, reason: "chain setup" } });
+    assert.equal(moved.status, 200);
+  }
+
+  const receiptIds = [];
+  for (let i = 1; i <= count; i += 1) {
+    const attached = await req("POST", `/api/evidence/${evidenceId}/receipts`, {
+      token,
+      body: { receipt_type: "log", description: `${label} receipt ${i}` }
+    });
+    assert.equal(attached.status, 201);
+    const added = attached.body.receipts.map((r) => r.id).filter((id) => !receiptIds.includes(id));
+    assert.equal(added.length, 1, "each attach adds exactly one receipt");
+    receiptIds.push(added[0]);
+  }
+  return { token, tenantId: created.body.actor.tenantId, receiptIds };
+}
+
+// The append-only trigger refuses this UPDATE from the app, so simulate an
+// attacker with direct database access by bypassing triggers for one change.
+async function tamperReceiptDescription(receiptId) {
+  const pg = await import("pg");
+  const client = new pg.default.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  await client.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SET LOCAL session_replication_role = replica");
+    const updated = await client.query(
+      "UPDATE evidence_receipts SET description = description || ' (altered)' WHERE id = $1",
+      [receiptId]
+    );
+    assert.equal(updated.rowCount, 1);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    await client.end();
+  }
+}
+
+test("receipts: verify-chain passes for an intact tenant chain", async () => {
+  const { token, tenantId } = await tenantWithReceiptChain("Chain Intact", 3);
+
+  const chain = await req("GET", "/api/receipts/verify-chain", { token });
+  assert.equal(chain.status, 200);
+  assert.equal(chain.body.verified, true);
+  assert.equal(chain.body.tenant_id, tenantId);
+  assert.equal(chain.body.sealed_receipts, 3);
+  assert.equal(chain.body.unsealed_receipts, 0);
+  assert.equal(chain.body.chain_tip.chain_sequence, 3);
+  assert.deepEqual(chain.body.failures, []);
+});
+
+test("receipts: verify-chain reports a tampered receipt", async () => {
+  const { token, receiptIds } = await tenantWithReceiptChain("Chain Tampered", 3);
+  const tampered = receiptIds[1];
+
+  await tamperReceiptDescription(tampered);
+
+  const chain = await req("GET", "/api/receipts/verify-chain", { token });
+  assert.equal(chain.status, 200);
+  assert.equal(chain.body.verified, false);
+  assert.equal(chain.body.sealed_receipts, 3);
+  assert.equal(chain.body.failures.length, 1, "only the altered receipt fails");
+  const [failure] = chain.body.failures;
+  assert.equal(failure.receipt_id, tampered);
+  assert.equal(failure.chain_sequence, 2);
+  assert.equal(failure.cryptographic_checks.hash, false, "the recomputed hash no longer matches");
+  assert.equal(failure.previous_link, true, "the stored links are untouched");
+});
+
+test("receipts: verify passes for an intact receipt", async () => {
+  const { token, receiptIds } = await tenantWithReceiptChain("Receipt Intact", 3);
+
+  const verified = await req("GET", `/api/receipts/${receiptIds[1]}/verify`, { token });
+  assert.equal(verified.status, 200);
+  assert.equal(verified.body.verified, true);
+  assert.equal(verified.body.status, "VERIFIED");
+  assert.equal(verified.body.receipt.id, receiptIds[1]);
+  assert.equal(verified.body.checks.previous_link, true);
+  assert.equal(verified.body.checks.next_link, true);
+  for (const [name, ok] of Object.entries(verified.body.checks)) {
+    assert.equal(ok, true, `check ${name} passes`);
+  }
+});
+
+test("receipts: verify reports a tampered receipt", async () => {
+  const { token, receiptIds } = await tenantWithReceiptChain("Receipt Tampered", 3);
+  const tampered = receiptIds[1];
+  await tamperReceiptDescription(tampered);
+
+  const verified = await req("GET", `/api/receipts/${tampered}/verify`, { token });
+  assert.equal(verified.status, 200);
+  assert.equal(verified.body.verified, false);
+  assert.equal(verified.body.status, "TAMPER_DETECTED");
+  assert.equal(verified.body.receipt.id, tampered);
+  assert.equal(verified.body.checks.hash, false, "the recomputed hash no longer matches");
+  assert.equal(verified.body.checks.previous_link, true, "the stored links are untouched");
+  assert.equal(verified.body.checks.next_link, true, "the stored links are untouched");
+
+  // Its untouched neighbour still verifies on its own.
+  const neighbour = await req("GET", `/api/receipts/${receiptIds[2]}/verify`, { token });
+  assert.equal(neighbour.status, 200);
+  assert.equal(neighbour.body.status, "VERIFIED");
+});
+
 async function resetAuthAttempts() {
   await adminQuery("DELETE FROM auth_attempts");
 }

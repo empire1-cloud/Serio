@@ -733,6 +733,89 @@ test("billing stays reachable for a read-only tenant so they can pay to return",
   assert.equal(checkout.status, 503, "it refuses only because Stripe is unconfigured here");
 });
 
+// A fresh organisation owns its own receipt chain, so these assertions are
+// independent of whatever receipts other tests have written.
+async function tenantWithReceiptChain(label, count) {
+  await resetAuthAttempts();
+  const suffix = randomUUID().slice(0, 8);
+  const created = await req("POST", "/api/auth/signup", {
+    body: { organisationName: `${label} ${suffix}`, email: `${label.toLowerCase().replace(/\W+/g, "-")}-${suffix}@example.com`, password: "a-long-enough-passphrase" }
+  });
+  assert.equal(created.status, 201);
+  const token = created.body.token;
+
+  const evidence = await req("POST", "/api/evidence", { token, body: { claim: `${label} claim ${suffix}` } });
+  assert.equal(evidence.status, 201);
+  const evidenceId = evidence.body.id;
+  for (const to of ["AUTHORIZED", "EXECUTED"]) {
+    const moved = await req("POST", `/api/evidence/${evidenceId}/transition`, { token, body: { to, reason: "chain setup" } });
+    assert.equal(moved.status, 200);
+  }
+
+  const receiptIds = [];
+  for (let i = 1; i <= count; i += 1) {
+    const attached = await req("POST", `/api/evidence/${evidenceId}/receipts`, {
+      token,
+      body: { receipt_type: "log", description: `${label} receipt ${i}` }
+    });
+    assert.equal(attached.status, 201);
+    const added = attached.body.receipts.map((r) => r.id).filter((id) => !receiptIds.includes(id));
+    assert.equal(added.length, 1, "each attach adds exactly one receipt");
+    receiptIds.push(added[0]);
+  }
+  return { token, tenantId: created.body.actor.tenantId, receiptIds };
+}
+
+test("receipts: verify-chain passes for an intact tenant chain", async () => {
+  const { token, tenantId } = await tenantWithReceiptChain("Chain Intact", 3);
+
+  const chain = await req("GET", "/api/receipts/verify-chain", { token });
+  assert.equal(chain.status, 200);
+  assert.equal(chain.body.verified, true);
+  assert.equal(chain.body.tenant_id, tenantId);
+  assert.equal(chain.body.sealed_receipts, 3);
+  assert.equal(chain.body.unsealed_receipts, 0);
+  assert.equal(chain.body.chain_tip.chain_sequence, 3);
+  assert.deepEqual(chain.body.failures, []);
+});
+
+test("receipts: verify-chain reports a tampered receipt", async () => {
+  const { token, receiptIds } = await tenantWithReceiptChain("Chain Tampered", 3);
+  const tampered = receiptIds[1];
+
+  // The append-only trigger refuses this UPDATE from the app, so simulate an
+  // attacker with direct database access by bypassing triggers for one change.
+  const pg = await import("pg");
+  const client = new pg.default.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  await client.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SET LOCAL session_replication_role = replica");
+    const updated = await client.query(
+      "UPDATE evidence_receipts SET description = description || ' (altered)' WHERE id = $1",
+      [tampered]
+    );
+    assert.equal(updated.rowCount, 1);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    await client.end();
+  }
+
+  const chain = await req("GET", "/api/receipts/verify-chain", { token });
+  assert.equal(chain.status, 200);
+  assert.equal(chain.body.verified, false);
+  assert.equal(chain.body.sealed_receipts, 3);
+  assert.equal(chain.body.failures.length, 1, "only the altered receipt fails");
+  const [failure] = chain.body.failures;
+  assert.equal(failure.receipt_id, tampered);
+  assert.equal(failure.chain_sequence, 2);
+  assert.equal(failure.cryptographic_checks.hash, false, "the recomputed hash no longer matches");
+  assert.equal(failure.previous_link, true, "the stored links are untouched");
+});
+
 async function resetAuthAttempts() {
   await adminQuery("DELETE FROM auth_attempts");
 }

@@ -65,7 +65,7 @@ Before describing production receipts as cryptographically tamper-evident:
 3. Set `RECEIPT_SIGNING_PRIVATE_KEY_B64` and a versioned `RECEIPT_SIGNING_KEY_ID`.
 4. Publish/pin the corresponding public-key fingerprint for enterprise verifiers.
 5. Run the full tenant Receipt Graph verification and retain the result as evidence.
-6. Exercise key rotation and recovery as controlled, receipted operational procedures.
+6. Exercise key rotation (`RECEIPT_KEY_ROTATION.md`) and recovery as controlled, receipted operational procedures.
 7. Record backup/restore and tenant-isolation tests as evidence records, not screenshots alone.
 
 ## Canon

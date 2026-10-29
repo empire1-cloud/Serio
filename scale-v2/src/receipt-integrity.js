@@ -7,6 +7,7 @@ import {
   getReceiptSigner,
   receiptSignerInfo,
   signReceiptEnvelope,
+  trustedReceiptKeys,
   verifyReceiptProof,
 } from "./domain/receipt-integrity.js";
 
@@ -192,8 +193,9 @@ async function assertReversalTargetOwned(client, receiptId) {
 }
 
 export function assertReceiptIntegrityReady() {
-  // Loading the signer performs every key validation and fails production
-  // closed when key custody is not configured.
+  // Loading the signer and trusted keys performs every key validation and
+  // fails production closed when key custody is not configured.
+  trustedReceiptKeys();
   return receiptSignerInfo();
 }
 
@@ -318,7 +320,7 @@ export async function verifyReceipt(actor, receiptId) {
     }
 
     const proof = proofForRow(row);
-    const cryptographic = verifyReceiptProof(proof);
+    const cryptographic = verifyReceiptProof(proof, { trustedKeys: trustedReceiptKeys() });
     const sequence = Number(row.chain_sequence);
     let previousLink = true;
     let nextLink = true;
@@ -370,7 +372,7 @@ export async function verifyReceiptChain(actor) {
     for (const row of sealed) {
       const sequence = Number(row.chain_sequence);
       const proof = proofForRow(row);
-      const crypto = verifyReceiptProof(proof);
+      const crypto = verifyReceiptProof(proof, { trustedKeys: trustedReceiptKeys() });
       const sequenceOk = sequence === expectedSequence;
       const linkOk = row.previous_hash === previousHash;
       if (!crypto.verified || !sequenceOk || !linkOk) {

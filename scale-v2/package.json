@@ -13,7 +13,8 @@
     "seed:demo-genome": "node scripts/seed-demo-genome.js",
     "receipts:keygen": "node scripts/generate-receipt-key.js",
     "receipts:verify": "node scripts/verify-receipt-proof.js",
-    "check": "node --check src/server.js && node --check src/receipt-integrity.js && node --check src/domain/receipt-integrity.js && node --check scripts/seed-demo-genome.js && node --check scripts/generate-receipt-key.js && node --check scripts/verify-receipt-proof.js",
+    "receipts:rotate": "node scripts/rotate-receipt-key.js",
+    "check": "node --check src/server.js && node --check src/receipt-integrity.js && node --check src/domain/receipt-integrity.js && node --check scripts/seed-demo-genome.js && node --check scripts/generate-receipt-key.js && node --check scripts/verify-receipt-proof.js && node --check scripts/rotate-receipt-key.js",
     "start:deploy": "node scripts/migrate.js && node src/server.js"
   },
   "dependencies": {

@@ -91,6 +91,7 @@ function developmentPrivateKey() {
 }
 
 let cachedSigner = null;
+let cachedTrustedKeys = null;
 
 /**
  * Load the active signing key. Production refuses to operate without a key
@@ -146,6 +147,53 @@ export function getReceiptSigner() {
   return cachedSigner;
 }
 
+/**
+ * Public keys that receipts may be signed with: the active signer plus every
+ * retired key listed in RECEIPT_RETIRED_PUBLIC_KEYS_JSON as
+ * {"<key_id>": "<public_key_b64>"}. Only public keys belong here, so the value
+ * is safe to keep in ordinary deployment config. Rotation moves the outgoing
+ * key into this list; dropping a key from it makes its receipts untrusted.
+ */
+export function trustedReceiptKeys() {
+  if (cachedTrustedKeys) return cachedTrustedKeys;
+
+  const signer = getReceiptSigner();
+  const keys = new Map([[signer.keyId, signer.publicKeyB64]]);
+  const raw = String(process.env.RECEIPT_RETIRED_PUBLIC_KEYS_JSON ?? "").trim();
+  if (raw) {
+    let retired;
+    try {
+      retired = JSON.parse(raw);
+    } catch {
+      throw new Error("RECEIPT_RETIRED_PUBLIC_KEYS_JSON is not valid JSON");
+    }
+    if (!retired || typeof retired !== "object" || Array.isArray(retired)) {
+      throw new Error("RECEIPT_RETIRED_PUBLIC_KEYS_JSON must be an object of key_id -> public_key_b64");
+    }
+    for (const [keyId, publicKeyB64] of Object.entries(retired)) {
+      const encoded = String(publicKeyB64 ?? "").trim();
+      if (keyId === signer.keyId) {
+        throw new Error(`Retired receipt key ${keyId} reuses the active key ID; rotate to a new key ID`);
+      }
+      try {
+        createPublicKey({ key: Buffer.from(encoded, "base64"), format: "der", type: "spki" });
+      } catch {
+        throw new Error(`Retired receipt key ${keyId} is not a valid public key`);
+      }
+      keys.set(keyId, encoded);
+    }
+  }
+
+  cachedTrustedKeys = keys;
+  return cachedTrustedKeys;
+}
+
+/** Drop cached key material so the next call re-reads the environment. */
+export function resetReceiptKeyCache() {
+  cachedSigner = null;
+  cachedTrustedKeys = null;
+}
+
 export function receiptSignerInfo() {
   const signer = getReceiptSigner();
   return {
@@ -176,8 +224,13 @@ export function signReceiptEnvelope(envelope) {
   };
 }
 
-/** Pure verification; this is also used by the offline verifier script. */
-export function verifyReceiptProof(proof) {
+/**
+ * Pure verification; this is also used by the offline verifier script.
+ * Pass `trustedKeys` (key_id -> public_key_b64) to also require that the
+ * proof was signed by a key this deployment issued, not merely by the key
+ * stored next to it.
+ */
+export function verifyReceiptProof(proof, { trustedKeys } = {}) {
   const envelope = proof?.envelope;
   const claimedHash = String(proof?.receipt_hash ?? "");
   const signature = String(proof?.signature ?? "");
@@ -192,6 +245,7 @@ export function verifyReceiptProof(proof) {
     key_id_bound: false,
     signature: false,
   };
+  if (trustedKeys) checks.key_trusted = false;
 
   try {
     const computedHash = hashReceiptEnvelope(envelope);
@@ -200,6 +254,9 @@ export function verifyReceiptProof(proof) {
     const fingerprint = publicKeyFingerprint(publicKeyB64);
     checks.key_fingerprint = fingerprint === envelope?.signing_key_fingerprint;
     checks.key_id_bound = String(proof?.key_id ?? "") === String(envelope?.key_id ?? "");
+    if (trustedKeys) {
+      checks.key_trusted = trustedKeys.get(String(proof?.key_id ?? "")) === publicKeyB64;
+    }
 
     const publicKey = createPublicKey({
       key: Buffer.from(publicKeyB64, "base64"),
